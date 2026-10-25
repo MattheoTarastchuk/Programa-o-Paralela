@@ -1,105 +1,485 @@
+#define _GNU_SOURCE
 #include <stdio.h>
-#include <pthread.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <errno.h>
-#include <sys/time.h>
-#include <sys/syscall.h>
-
+#include <limits.h>
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 #include "chrono.c"
 
-#define MAX_THREADS 4
-#define MAX_ELEMENTOS 8000000
-#define element_TYPE long long
+typedef long long TYPE;
 
-int parallelPrefixSum_thread_id[MAX_THREADS];
-int parallelPrefixSum_nThreads; // obtido na linha de comando
-int parallelPrefixSum_nTotalElements;  //obtido na linha de comando
+#define MAX_THREADS 64
+#define NTIMES 100
 
-element_TYPE InputVector[MAX_ELEMENTOS];
-pthread_barrier_t parallelPrefixSum_barrier;
-int min(int a, int b)
+static pthread_t poolThreads[MAX_THREADS];
+static int threadIDs[MAX_THREADS];
+
+static int poolNThreads;
+static long poolNElements;
+
+static volatile TYPE *poolVector;
+static TYPE *poolPartialSum;
+
+static pthread_barrier_t poolStartBarrier;
+static pthread_barrier_t poolPhaseBarrier;
+static pthread_barrier_t poolFinishBarrier;
+
+static bool poolInitialized = false;
+static bool poolStop = false;
+
+static long poolChunksize;
+
+static void getThreadRange(int id, long *first, long *end)
 {
-	if ( a < b)
-		return a;
-	else 
-		return b;
+	long base = poolNElements / poolNThreads;
+	long remainder = poolNElements % poolNThreads;
+
+	*first = base * id + (id < remainder ? id : remainder);
+	*end = *first + base + (id < remainder ? 1 : 0);
 }
-void *ParallelPrefixSumPth( long long *Vec, long nTotalElmts, int nThreads)
+
+static int getCpuForThread(int threadId, int *cpuId)
 {
+        cpu_set_t allowed;
 
-	int myIndex = *((long long *) Vec);
-	int nElements = (parallelPrefixSum_nTotalElements+(parallelPrefixSum_nThreads - 1)) / parallelPrefixSum_nThreads;
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+        {
+                perror("sched_getaffinity");
+                return -1;
+        }
 
-	int first = myIndex * nElements;
-	int last = min( (myIndex+1) * nElements, parallelPrefixSum_nTotalElements) - 1;
-	printf("thread %d here! first = %d, last = %d nElements = %d\n", myIndex, first, last, nElements);
-	element_TYPE *parcialSum = InputVector;
-	while(true)
-	{
-		pthread_barrier_wait( &parallelPrefixSum_barrier );
-		register element_TYPE myParcialSum = 0;
-		for ( int i = first; i <= last; i++)
-			myParcialSum += parcialSum[i];
-		pthread_barrier_wait(&parallelPrefixSum_barrier);
-	}
-	if (myIndex == 0)
-		return NULL;
-	else
-		pthread_exit(NULL);
-	return NULL;
+        int index = 0;
 
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        {
+                if (CPU_ISSET(cpu, &allowed))
+                {
+                        if (index == threadId)
+                        {
+                                *cpuId = cpu;
+                                return 0;
+                        }
+
+                        index++;
+                }
+        }
+
+        fprintf(stderr, "Nao ha CPU permitida para a thread %d.\n", threadId);
+        return -1;
 }
-int main (int argc, char *argv[])
+
+static int pinCurrentThread(int threadId)
 {
-	int i;
-	int nThreads;
-	int nTotalElements;
+        int cpuId;
+        cpu_set_t cpuset;
 
-	chronometer_t parallelPrefixSumTime;
+        if (getCpuForThread(threadId, &cpuId) != 0)
+                return -1;
 
-	if (argc != 3)
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpuId, &cpuset);
+
+        int err = pthread_setaffinity_np( pthread_self(), sizeof(cpuset), &cpuset);
+
+        if (err != 0)
+        {
+                fprintf(stderr, "Erro ao fixar thread %d na CPU %d: %s\n", threadId, cpuId, strerror(err));
+                return -1;
+        }
+
+        return 0;
+}
+
+static void prefixSumPhase1(int id)
+{
+	long first, end;
+	getThreadRange(id, &first, &end);
+
+	TYPE sum = 0;
+
+	long blockSize = poolChunksize > 0 ? poolChunksize : end - first;
+
+	if (blockSize <= 0)
 	{
-		printf ("usage: %s <nTotalElements> <nThreads>\n", argv[0]);
-		return 0;
+		poolPartialSum[id] = 0;
+		return;
 	}
-	else
+
+	for (long blockStart = first; blockStart < end; blockStart += blockSize)
 	{
-		nThreads = atoi(argv[2]);
-		if (nThreads == 0)
+		long blockEnd = blockStart + blockSize;
+
+		if (blockEnd > end)
+			blockEnd = end;
+
+		for (long i = blockStart; i < blockEnd; i++)
+			sum += poolVector[i];
+	}
+
+	poolPartialSum[id] = sum;
+}
+
+static void prefixSumPhase2(int id)
+{
+	long first, end;
+	getThreadRange(id, &first, &end);
+
+	TYPE prefix = 0;
+
+	for (int t = 0; t < id; t++)
+		prefix += poolPartialSum[t];
+
+	long blockSize = poolChunksize > 0 ? poolChunksize : end - first;
+
+	if (blockSize <= 0)
+		return;
+
+	for (long blockStart = first; blockStart < end; blockStart += blockSize)
+	{
+		long blockEnd = blockStart + blockSize;
+
+		if (blockEnd > end)
+			blockEnd = end;
+
+		for (long i = blockStart; i < blockEnd; i++)
 		{
-			printf("usage: %s <nTotalElements> <nThreads>\n", argv[0]);
+			prefix += poolVector[i];
+			poolVector[i] = prefix;
 		}
-		nTotalElements = atoi(argv[1]);
 	}
-	for( long i = 0; i < nTotalElements; i++ ){
-		int r = rand();  // Returns a pseudo-random integer
-	                     //    between 0 and RAND_MAX.
-		InputVector[i] = (r % 1000) - 500;
-	}
-	chrono_reset(&parallelPrefixSumTime);
-	chrono_start(&parallelPrefixSumTime);
+}
 
-	void *globalSum;
-	int start_position = 0;
-	element_TYPE *InVec = &InputVector[start_position];
 
-	#define NTIMES 10
+static void *prefixSumWorker(void *arg)
+{
+	int id = *((int *)arg);
+	if (pinCurrentThread(id) != 0)
+                fprintf(stderr, "Aviso: thread %d continuara sem afinidade configurada. \n", id);
 
-	for (int i = 0; i < NTIMES; i++)
+	while (true) 
 	{
-		globalSum = ParallelPrefixSumPth(InVec, nTotalElements, nThreads);
-		start_position += nTotalElements;
-		if ((start_position + nTotalElements) > MAX_ELEMENTOS)
-			start_position = 0;
-		InVec = &InputVector[start_position];
-	}
-	chrono_stop(&parallelPrefixSumTime);
-	printf("globalSum = %lf\n", globalSum);
+        	pthread_barrier_wait(&poolStartBarrier);
+       
+        	if (poolStop) 
+		{
+            		break;
+        	}
+		prefixSumPhase1(id);
 
-	chrono_reportTime(&parallelPrefixSumTime, "parallelPrefixSumTime");
-	double total_time_in_secound = (double) chrono_gettotal (&parallelPrefixSumTime) / ((double)1000*1000*1000);	
-	
+		pthread_barrier_wait(&poolPhaseBarrier);
+		prefixSumPhase2(id);
+
+		pthread_barrier_wait(&poolFinishBarrier);
+    	}	
+
+	return NULL;
+}
+
+
+static int prefixSumPoolInit(int nThreads)
+{
+	poolNThreads = nThreads;
+
+	poolPartialSum = malloc((size_t)nThreads * sizeof(TYPE));
+
+	if (poolPartialSum == NULL) 
+	{
+        	perror("malloc PartialSum");
+        	return -1;
+    	}
+
+	if (pthread_barrier_init(&poolStartBarrier, NULL, (unsigned)nThreads) != 0) 
+	{
+        	fprintf(stderr, "Erro ao criar barreira inicial.\n");
+        	free(poolPartialSum);
+        	poolPartialSum = NULL;
+        	return -1;
+    	}
+
+	if (pthread_barrier_init(&poolPhaseBarrier, NULL, (unsigned)nThreads) != 0) 
+	{
+        	fprintf(stderr, "Erro ao criar barreira de fase.\n");
+        	pthread_barrier_destroy(&poolStartBarrier);
+        	free(poolPartialSum);
+        	poolPartialSum = NULL;
+        	return -1;
+    	}
+
+	if (pthread_barrier_init(&poolFinishBarrier, NULL, (unsigned)nThreads) != 0) 
+	{
+        	fprintf(stderr, "Erro ao criar barreira final.\n");
+        	pthread_barrier_destroy(&poolPhaseBarrier);
+       		pthread_barrier_destroy(&poolStartBarrier);
+        	free(poolPartialSum);
+        	poolPartialSum = NULL;
+        	return -1;
+    	}
+
+	for (int t = 1; t < nThreads; t++) 
+	{
+        	threadIDs[t] = t;
+
+        	int err = pthread_create( &poolThreads[t], NULL, prefixSumWorker, &threadIDs[t] );
+		if (err != 0) 
+		{
+			fprintf(stderr, "Erro ao criar thread %d: %s\n", t, strerror(err));
+            		exit(EXIT_FAILURE);
+        	}
+    	}
+
+	poolInitialized = true;
 	return 0;
+}
+
+
+void ParallelPrefixSumPth(volatile TYPE *Vec, long nTotalElmts, long chunkSize, int nThreads)
+{
+
+
+	if (Vec == NULL || nTotalElmts <= 0 || nThreads < 1 || nThreads > MAX_THREADS || chunkSize < 0 )
+	{
+        	fprintf(stderr, "Argumentos invalidos para o algoritmo.\n");
+       		exit(EXIT_FAILURE);
+    
+	}
+
+        if (!poolInitialized)
+        {
+                int cpuId;
+
+                if (getCpuForThread(nThreads - 1, &cpuId) != 0)
+                {
+                        fprintf(stderr, "Numero de threads excede as CPUs permitidas.\n");
+                        exit(EXIT_FAILURE);
+                }
+
+                if (prefixSumPoolInit(nThreads) != 0)
+                        exit(EXIT_FAILURE);
+
+                if (pinCurrentThread(0) != 0)
+                        exit(EXIT_FAILURE);
+
+        } 
+	else if (nThreads != poolNThreads) 
+	{
+        	fprintf(stderr, "O numero de threads deve permanecer constante.\n");
+        	exit(EXIT_FAILURE);
+    	}
+
+	poolVector = Vec;
+	poolNElements = nTotalElmts;
+	poolChunksize = chunkSize;
+	
+	pthread_barrier_wait(&poolStartBarrier);
+
+	prefixSumPhase1(0);
+
+	pthread_barrier_wait(&poolPhaseBarrier);
+
+	prefixSumPhase2(0);
+
+	pthread_barrier_wait(&poolFinishBarrier);
+}
+
+
+static void prefixSumPoolDestroy(void)
+{
+	if (!poolInitialized) 
+	{
+        	return;
+    	}
+
+	poolStop = true;
+
+	pthread_barrier_wait(&poolStartBarrier);
+
+	for (int t = 1; t < poolNThreads; t++) 
+	{
+        	pthread_join(poolThreads[t], NULL);
+	}
+
+	pthread_barrier_destroy(&poolStartBarrier);
+	pthread_barrier_destroy(&poolPhaseBarrier);
+	pthread_barrier_destroy(&poolFinishBarrier);
+
+	free(poolPartialSum);
+	poolPartialSum = NULL;
+	poolInitialized = false;
+}
+
+
+static bool verifyPrefixSum(const TYPE *original, const TYPE *result, long n)
+{
+	TYPE sum = 0;
+
+	for (long i = 0; i < n; i++) 
+	{
+        	sum += original[i];
+
+        	if (result[i] != sum) 
+		{
+            		fprintf(stderr, "Erro na posicao %ld: esperado %lld, obtido %lld\n", i, sum, result[i]);
+            		return false;
+        	}
+    	}
+
+    	return true;
+}
+
+int main(int argc, char *argv[])
+{
+	if (argc != 4 && argc != 5) 
+	{
+        	fprintf(stderr, "Uso: %s <nTotalElements> <nThreads> <chunkSize> [-v]\n", argv[0]);
+        	return EXIT_FAILURE;
+    	}
+
+	char *endptr;
+
+	errno = 0;
+	long nTotalElements = strtol(argv[1], &endptr, 10);
+
+	if (errno != 0 || *endptr != '\0' || nTotalElements <= 0 || (unsigned long)nTotalElements > (size_t)-1 / sizeof(TYPE)) 
+	{
+        	fprintf(stderr, "Quantidade de elementos invalida.\n");
+        	return EXIT_FAILURE;
+    	}
+
+	errno = 0;
+	long threadArg = strtol(argv[2], &endptr, 10);
+
+	if (errno != 0 || *endptr != '\0' || threadArg < 1 || threadArg > MAX_THREADS) 
+	{
+        	fprintf(stderr, "Numero de threads invalido (1 a %d).\n", MAX_THREADS);
+        	return EXIT_FAILURE;
+    	}
+
+	errno = 0;
+	long chunkSize = strtol(argv[3], &endptr, 10);
+
+	if (errno != 0 || *endptr != '\0' || chunkSize < 0) 
+	{
+		fprintf(stderr, "chunkSize invalido.\n");
+        	return EXIT_FAILURE;
+    	}
+
+	bool verbose = false;
+
+	if (argc == 5) 
+	{
+        	if (strcmp(argv[4], "-v") != 0) 
+		{
+            	fprintf(stderr, "Opcao desconhecida: %s\n", argv[4]);
+            	return EXIT_FAILURE;
+        	}
+        	verbose = true;
+    	}
+
+	int nThreads = (int)threadArg;
+
+	TYPE *InputVector = malloc((size_t)nTotalElements * sizeof(TYPE));
+	TYPE *Vector = malloc((size_t)nTotalElements * sizeof(TYPE));
+	
+	if (InputVector == NULL || Vector == NULL) 
+	{
+        	perror("malloc vetor");
+        	free(InputVector);
+        	free(Vector);
+        	return EXIT_FAILURE;
+    	}
+
+	srand(1);
+
+	for (long i = 0; i < nTotalElements; i++) 
+	{
+        	InputVector[i] = (rand() % 1000) - 500;
+    	}
+
+	memcpy(Vector, InputVector, (size_t)nTotalElements * sizeof(TYPE));
+
+	printf("Elementos: %ld\n", nTotalElements);
+	printf("Threads: %d\n", nThreads);
+	printf("Chunk size: %ld\n", chunkSize);
+	
+
+	chronometer_t chronoTotal;
+	chronometer_t chronoCopy;
+
+	chrono_reset(&chronoTotal);
+	chrono_reset(&chronoCopy);
+
+
+	ParallelPrefixSumPth(Vector, nTotalElements, chunkSize, nThreads);
+
+	chrono_start(&chronoTotal);
+
+	for (int i = 0; i < NTIMES; i++) 
+	{
+    
+    		chrono_start(&chronoCopy);
+	
+    		memcpy(Vector, InputVector, nTotalElements * sizeof(TYPE));
+
+    		chrono_stop(&chronoCopy);
+
+    
+    		ParallelPrefixSumPth(Vector, nTotalElements, chunkSize, nThreads);
+	}
+
+	chrono_stop(&chronoTotal);
+
+
+	long long totalNs = chrono_gettotal(&chronoTotal);
+	long long copyNs = chrono_gettotal(&chronoCopy);
+	long long netNs = totalNs - copyNs;
+
+	double averageSeconds = (double)netNs / NTIMES / 1.0e9;
+	double throughput = ((double)nTotalElements * NTIMES)
+                    / ((double)netNs / 1.0e9);
+
+	printf("\n--- Desempenho ---\n");
+	printf("Numero de execucoes: %d\n", NTIMES);
+	printf("Tempo total: %.6f s\n", (double)totalNs / 1.0e9);
+	printf("Tempo de copia: %.6f s\n", (double)copyNs / 1.0e9);
+	printf("Tempo liquido: %.6f s\n", (double)netNs / 1.0e9);
+	printf("Tempo medio por execucao: %.9f s\n", averageSeconds);
+	printf("Throughput: %.2f elementos/s\n", throughput);
+
+	if (verbose) 
+	{
+        	long limit = nTotalElements < 10 ? nTotalElements : 10;
+
+        	printf("Vetor original (primeiros elementos): ");
+        	for (long i = 0; i < limit; i++) 
+		{
+            		printf("%lld ", InputVector[i]);
+        	}
+        	printf("\n");
+    	}
+    	bool valid = verifyPrefixSum(InputVector, Vector, nTotalElements);
+
+    	if (verbose) 
+	{
+        	long limit = nTotalElements < 10 ? nTotalElements : 10;
+
+        	printf("Vetor resultante (primeiros elementos): ");
+       		for (long i = 0; i < limit; i++) 
+		{
+            		printf("%lld ", Vector[i]);
+        	}
+        	printf("\n");
+    	}
+
+    	printf("Validacao: %s\n", valid ? "OK" : "FALHOU");
+
+    	prefixSumPoolDestroy();
+
+    	free(InputVector);
+    	free(Vector);
+
+    	return valid ? EXIT_SUCCESS : EXIT_FAILURE;
 }
