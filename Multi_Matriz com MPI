@@ -1,0 +1,239 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+#include <string.h>
+#include "chrono.c"
+
+static void gera_matriz(double *X, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        X[i] = (double)(rand() % 9 - 4);
+}
+
+static size_t verifica_resultado(int Nla, int M, int Ncb,
+                                 const double *A,
+                                 const double *B,
+                                 const double *C)
+{
+    size_t erros = 0;
+
+    for (int i = 0; i < Nla; i++)
+    {
+        for (int j = 0; j < Ncb; j++)
+        {
+            double soma = 0.0;
+
+            for (int k = 0; k < M; k++)
+            {
+                soma += A[(size_t)i * M + k] *
+                        B[(size_t)k * Ncb + j];
+            }
+
+            if (soma != C[(size_t)i * Ncb + j])
+            {
+                if (erros == 0)
+                {
+                    printf("\nPrimeiro erro encontrado:\n");
+                    printf("C[%d][%d]: esperado %.17g, obtido %.17g\n",
+                           i, j, soma, C[(size_t)i * Ncb + j]);
+                }
+
+                erros++;
+            }
+        }
+    }
+
+    if (erros == 0)
+        printf("\nValidacao: OK! Todos os elementos estao corretos.\n");
+    else
+        printf("\nValidacao: %zu elementos incorretos.\n", erros);
+
+    return erros;
+}
+
+int main(int argc, char *argv[])
+{
+    int rank, nprocs;
+
+    MPI_Init(&argc, &argv);
+
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+
+    if (argc < 4)
+    {
+        if (rank == 0)
+            fprintf(stderr, "Uso: mpirun -np n ./mmul Nla M Ncb\n");
+
+        MPI_Finalize();
+        return 1;
+    }
+
+    int Nla = atoi(argv[1]);
+    int M   = atoi(argv[2]);
+    int Ncb = atoi(argv[3]);
+    
+    int verifica = 0;
+    
+    for (int i = 4; i < argc; i++)
+    {
+    	if(strcmp(argv[i], "-v") == 0)
+    		verifica = 1;
+    }
+
+    if (Nla <= 0 || M <= 0 || Ncb <= 0 || Nla % nprocs != 0)
+    {
+        if (rank == 0)
+            fprintf(stderr, "Dimensoes invalidas ou Nla nao divisivel por nprocs.\n");
+
+        MPI_Finalize();
+        return 1;
+    }
+
+    int linhas_por_proc = Nla / nprocs;
+
+    size_t tam_A = (size_t)Nla * M;
+    size_t tam_B = (size_t)M * Ncb;
+    size_t tam_C = (size_t)Nla * Ncb;
+
+    double *A = NULL;
+    double *B = malloc(tam_B * sizeof(double));
+    double *C = NULL;
+
+    double *meu_A = malloc((size_t)linhas_por_proc * M * sizeof(double));
+    double *meu_C = malloc((size_t)linhas_por_proc * Ncb * sizeof(double));
+
+    if (rank == 0)
+    {
+        A = malloc(tam_A * sizeof(double));
+        C = malloc(tam_C * sizeof(double));
+    }
+
+    if (!B || !meu_A || !meu_C || (rank == 0 && (!A || !C)))
+    {
+        fprintf(stderr, "Rank %d: erro de alocacao.\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    if (rank == 0)
+    {
+        srand(1);
+
+        gera_matriz(A, tam_A);
+        gera_matriz(B, tam_B);
+    }
+	chronometer_t chrono_total;
+	chronometer_t chrono_compute;
+	
+	chrono_reset(&chrono_total);
+	chrono_reset(&chrono_compute);
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	chrono_start(&chrono_total);
+
+    // Distribui as linhas de A entre os processos.
+    MPI_Scatter(
+        A,
+        linhas_por_proc * M,
+        MPI_DOUBLE,
+        meu_A,
+        linhas_por_proc * M,
+        MPI_DOUBLE,
+        0,
+        MPI_COMM_WORLD
+    );
+
+    // Distribui B completa para todos os processos.
+    MPI_Bcast(
+        B,
+        M * Ncb,
+        MPI_DOUBLE,
+        0,
+        MPI_COMM_WORLD
+    );
+
+    chrono_start(&chrono_compute);
+
+    // Cada processo calcula sua parte de C.
+    for (int i = 0; i < linhas_por_proc; i++)
+    {
+        for (int j = 0; j < Ncb; j++)
+        {
+            double soma = 0.0;
+
+            for (int k = 0; k < M; k++)
+            {
+                soma += meu_A[(size_t)i * M + k] *
+                        B[(size_t)k * Ncb + j];
+            }
+
+            meu_C[(size_t)i * Ncb + j] = soma;
+        }
+    }
+
+    chrono_stop(&chrono_compute);
+
+    // Reune os resultados no processo 0.
+    MPI_Gather(
+        meu_C,
+        linhas_por_proc * Ncb,
+        MPI_DOUBLE,
+        C,
+        linhas_por_proc * Ncb,
+        MPI_DOUBLE,
+        0,
+        MPI_COMM_WORLD
+    );
+
+    chrono_stop(&chrono_total);
+    
+    if (rank == 0 && verifica == 1)
+    	verifica_resultado(Nla, M, Ncb, A, B, C);
+
+    char hostname[MPI_MAX_PROCESSOR_NAME];
+    int hostname_len;
+
+    MPI_Get_processor_name(hostname, &hostname_len);
+
+    printf("Rank %d executado em %s\n", rank, hostname);
+
+    if (rank == 0)
+        printf("Multiplicacao concluida: C = A x B\n");
+
+	long long tempo_total_local = chrono_gettotal(&chrono_total);
+	long long tempo_compute_local = chrono_gettotal(&chrono_compute);
+
+	long long tempo_total_max = 0;
+	long long tempo_compute_max = 0;
+
+	MPI_Reduce(&tempo_total_local, &tempo_total_max, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+
+	MPI_Reduce(&tempo_compute_local, &tempo_compute_max, 1, MPI_LONG_LONG_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+	
+	if (rank == 0)
+	{
+		double tempo_total = tempo_total_max / 1e9;
+		double tempo_compute = tempo_compute_max / 1e9;
+		double tempo_com = tempo_total - tempo_compute;
+		double operacoes = 2.0 * Nla * M * Ncb;
+		double gflops = operacoes / (tempo_total * 1e9);
+
+		printf("\n========== DESEMPENHO ==========\n");
+		printf("Processos MPI: %d\n", nprocs);
+		printf("Tempo total: %.6f s\n", tempo_total);
+		printf("Tempo de computacao: %.6f s\n", tempo_compute);
+		printf("Tempo de comunicacao: %.6f s\n", tempo_com);
+		printf("GFLOPS: %.6f\n", gflops);
+	    	printf("===============================\n");
+	}
+    free(A);
+    free(B);
+    free(C);
+    free(meu_A);
+    free(meu_C);
+
+    MPI_Finalize();
+
+    return 0;
+}
