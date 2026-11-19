@@ -72,13 +72,20 @@ int main(int argc, char *argv[])
     int Nla = atoi(argv[1]);
     int M   = atoi(argv[2]);
     int Ncb = atoi(argv[3]);
-    
+ 
+    int versao_b = 0;
     int verifica = 0;
+    int w;
     
     for (int i = 4; i < argc; i++)
     {
     	if(strcmp(argv[i], "-v") == 0)
     		verifica = 1;
+	if(strcmp(argv[i], "-w") == 0)
+	{
+		versao_b = 1;
+		w = atoi(argv[i+1]);
+	}
     }
 
     if (Nla <= 0 || M <= 0 || Ncb <= 0 || Nla % nprocs != 0)
@@ -152,11 +159,63 @@ int main(int argc, char *argv[])
         0,
         MPI_COMM_WORLD
     );
+if (versao_b == 1)
+{
+    if (w <= 0)
+    {
+        if (rank == 0)
+            fprintf(stderr, "Erro: blockWidth deve ser positivo.\n");
+
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (M % 8 || Ncb % 8 || Nla % nprocs) {
+if (rank == 0) fprintf(stderr, "erro: M e Ncb devem ser multiplos de 8 "
+"e Nla divisivel por nprocs\n");
+MPI_Finalize();
+return 1;
+}
+
+    // Inicializa a matriz C local.
+    for (size_t i = 0; i < (size_t)linhas_por_proc * Ncb; i++)
+        meu_C[i] = 0.0;
 
     chrono_start(&chrono_compute);
 
-    // Cada processo calcula sua parte de C.
-    for (int i = 0; i < linhas_por_proc; i++)
+    for (int ii = 0; ii < linhas_por_proc; ii += w)
+    {
+        for (int kk = 0; kk < M; kk += w)
+        {
+            for (int jj = 0; jj < Ncb; jj += w)
+            {
+                int fim_i = (ii + w < linhas_por_proc) ? ii + w : linhas_por_proc;
+                int fim_k = (kk + w < M) ? kk + w : M;
+                int fim_j = (jj + w < Ncb) ? jj + w : Ncb;
+
+                for (int i = ii; i < fim_i; i++)
+                {
+                    for (int k = kk; k < fim_k; k++)
+                    {
+                        for (int j = jj; j < fim_j; j++)
+                        {
+                            meu_C[(size_t)i * Ncb + j] +=
+                                meu_A[(size_t)i * M + k] *
+                                B[(size_t)k * Ncb + j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    chrono_stop(&chrono_compute);
+}
+    else
+    {
+
+		chrono_start(&chrono_compute);
+
+		// Cada processo calcula sua parte de C.
+		for (int i = 0; i < linhas_por_proc; i++)
     {
         for (int j = 0; j < Ncb; j++)
         {
@@ -173,6 +232,7 @@ int main(int argc, char *argv[])
     }
 
     chrono_stop(&chrono_compute);
+    }
 
     // Reune os resultados no processo 0.
     MPI_Gather(
